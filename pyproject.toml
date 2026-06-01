@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "whatsername"
+version = "0.1.0"
+description = "Deterministic author-name parser: split a raw name string into title/first/middle/last/suffix/nickname, across Latin, CJK, Korean, Cyrillic, and Arabic scripts. From OpenAlex."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [
+    { name = "OpenAlex / OurResearch", email = "team@ourresearch.org" },
+]
+keywords = [
+    "name parser", "human name parser", "author names", "name parsing",
+    "author name disambiguation", "onomastics", "given name", "surname",
+    "bibliometrics", "scholarly", "openalex",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Processing :: Linguistic",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "unidecode>=1.3",   # GPL — drives Chinese pinyin, Cyrillic, Arabic fallback
+    "nameparser>=1.1",  # HumanNameParser fallback for low-confidence Latin names
+]
+
+[project.optional-dependencies]
+# Improved romanization for non-Latin scripts. The parser degrades gracefully
+# (lower confidence) when these are absent, so they're optional.
+cjk = [
+    "pykakasi>=2.2",         # Japanese kana/kanji -> Hepburn
+    "korean-romanizer>=0.25",# Hangul -> Latin
+    "transliterate>=1.10",   # extra Cyrillic coverage
+]
+
+[project.urls]
+Homepage = "https://github.com/ourresearch/whatsername"
+Source = "https://github.com/ourresearch/whatsername"
+"Gold standard" = "https://github.com/ourresearch/human-name-parser-gold-standard"
+
+[project.scripts]
+whatsername = "whatsername.parser:_cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/whatsername"]

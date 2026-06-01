@@ -1,0 +1,972 @@
+"""whatsername — deterministic author-name parser.
+
+Parses a raw author-name string into structured components
+(title, first, middle, last, suffix, nickname) with a confidence score.
+Handles Latin, Chinese, Japanese, Korean, Cyrillic, and Arabic/Persian scripts.
+
+Extracted from the OpenAlex author entity resolution pipeline (AER v4).
+Licensed GPL-3.0-or-later (see LICENSE) — required by the GPL `unidecode` dependency.
+"""
+
+import unicodedata
+import re
+import json
+from importlib import resources
+
+from nameparser import HumanName
+from unidecode import unidecode as _unidecode
+
+try:
+    from pykakasi import kakasi as _kakasi
+except ImportError:
+    _kakasi = None
+
+_kks = None  # lazily initialized
+
+try:
+    from korean_romanizer.romanizer import Romanizer as _Romanizer
+except ImportError:
+    _Romanizer = None
+
+try:
+    from transliterate import translit as _translit
+except ImportError:
+    _translit = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HNP fallback parser (original nameparser-based, used when confidence is low)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# -- CJK support for HNP fallback --
+
+COMPOUND_SURNAMES = {
+    '欧阳', '太史', '端木', '上官', '司马', '东方', '独孤', '南宫', '万俟',
+    '闻人', '夏侯', '诸葛', '尉迟', '公羊', '赫连', '澹台', '皇甫', '宗政',
+    '濮阳', '公冶', '太叔', '申屠', '公孙', '慕容', '仲孙', '钟离', '长孙',
+    '宇文', '司徒', '鲜于', '司空', '闾丘', '子车', '亓官', '司寇', '巫马',
+    '公西', '颛孙', '壤驷', '公良', '漆雕', '乐正', '宰父', '谷梁', '拓跋',
+    '夹谷', '轩辕', '令狐', '段干', '百里', '呼延', '东郭', '南门', '羊舌',
+    '微生', '公户', '公玉', '公仪', '梁丘', '公仲', '公上', '公门', '公山',
+    '公坚', '左丘', '公伯', '西门', '公祖', '第五', '公乘', '贯丘', '公皙',
+    '南荣', '东里', '东宫', '仲长', '子书', '子桑', '即墨', '达奚', '褚师',
+    '歐陽', '司馬', '東方', '獨孤', '南宮', '諸葛', '尉遲', '赫連', '澹臺',
+    '皇甫', '濮陽', '慕容', '鍾離', '長孫', '宇文', '鮮于', '閭丘', '顓孫',
+    '漆雕', '樂正', '穀梁', '拓跋', '夾谷', '軒轅', '段幹', '東郭', '南門',
+    '羊舌', '梁丘', '左丘', '西門', '東里', '東宮', '仲長'
+}
+
+def _is_cjk_char(char):
+    cp = ord(char)
+    return (
+        (0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF) or
+        (0x20000 <= cp <= 0x2A6DF) or (0xF900 <= cp <= 0xFAFF) or
+        (0x2F800 <= cp <= 0x2FA1F)
+    )
+
+def _is_all_cjk(s):
+    chars = s.replace(' ', '')
+    return len(chars) > 0 and all(_is_cjk_char(c) for c in chars)
+
+def _split_chinese_name(name):
+    if len(name) >= 2 and name[:2] in COMPOUND_SURNAMES:
+        return name[:2], name[2:]
+    return name[0], name[1:]
+
+def _hnp_parse_name(name_string):
+    name_string = name_string.strip()
+    if _is_all_cjk(name_string) and ' ' not in name_string:
+        surname, given = _split_chinese_name(name_string)
+        result = HumanName()
+        result.last = surname
+        result.first = given
+        return result
+    return HumanName(name_string)
+
+def _hnp_clean(s):
+    if s is None or s == '':
+        return ''
+    normalized = unicodedata.normalize('NFD', s)
+    without_diacritics = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
+    cleaned = without_diacritics.lower().replace('.', '')
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+def parse_human_name_hnp(name):
+    """Original HNP-based parser, used as fallback for low-confidence names."""
+    if name is None or not isinstance(name, str) or name.strip() == '':
+        return {'title': '', 'first': '', 'middle': '', 'last': '', 'suffix': '', 'nickname': ''}
+    try:
+        parsed = _hnp_parse_name(name)
+        return {
+            'title': _hnp_clean(parsed.title),
+            'first': _hnp_clean(parsed.first),
+            'middle': _hnp_clean(parsed.middle),
+            'last': _hnp_clean(parsed.last),
+            'suffix': _hnp_clean(parsed.suffix),
+            'nickname': _hnp_clean(parsed.nickname)
+        }
+    except Exception:
+        return {'title': '', 'first': '', 'middle': '', 'last': '', 'suffix': '', 'nickname': ''}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# New deterministic parser (aer-python-name-parser v2.2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Script detection ──
+
+def _np_is_cjk(c):
+    cp = ord(c)
+    return (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or
+            0xF900 <= cp <= 0xFAFF or 0x20000 <= cp <= 0x2A6DF or
+            0x3040 <= cp <= 0x309F or 0x30A0 <= cp <= 0x30FF)
+
+def _np_is_hangul(c):
+    cp = ord(c)
+    return (0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF or 0x3130 <= cp <= 0x318F)
+
+def _np_is_cyrillic(c):
+    cp = ord(c)
+    return 0x0400 <= cp <= 0x04FF or 0x0500 <= cp <= 0x052F
+
+def _np_is_arabic(c):
+    cp = ord(c)
+    return (0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F or
+            0xFB50 <= cp <= 0xFDFF or 0xFE70 <= cp <= 0xFEFF)
+
+def _np_has_cjk(s):
+    return any(_np_is_cjk(c) for c in s)
+
+def _np_has_hangul(s):
+    return any(_np_is_hangul(c) for c in s)
+
+def _np_has_cyrillic(s):
+    return any(_np_is_cyrillic(c) for c in s)
+
+def _np_has_arabic(s):
+    return any(_np_is_arabic(c) for c in s)
+
+def _np_has_latin_alpha(s):
+    return any(c.isalpha() and ord(c) < 128 for c in s)
+
+# ── Normalization ──
+
+def _np_to_ascii(s):
+    if s is None:
+        return None
+    s = s.replace('\u2010', '-').replace('\u2011', '-').replace('\u2012', '-')
+    s = s.replace('\u2013', '-').replace('\u2014', '-').replace('\u2015', '-')
+    s = s.replace('\u00ad', '-')
+    s = s.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
+    s = s.replace('ø', 'o').replace('Ø', 'O')
+    s = s.replace('æ', 'ae').replace('Æ', 'AE')
+    s = s.replace('ß', 'ss')
+    s = s.replace('đ', 'd').replace('Đ', 'D')
+    s = s.replace('ł', 'l').replace('Ł', 'L')
+    s = s.replace('ð', 'd').replace('Ð', 'D')
+    s = s.replace('þ', 'th').replace('Þ', 'Th')
+    s = s.replace('ı', 'i').replace('İ', 'i')
+    s = unicodedata.normalize('NFKD', s)
+    result = []
+    for c in s:
+        if c == '-':
+            result.append('-')
+        elif c == '.':
+            result.append('.')
+        elif c in ("'", '\u2019', '\u2018', '\u02bc'):
+            continue
+        elif unicodedata.category(c) == 'Mn':
+            continue
+        elif ord(c) < 128:
+            result.append(c)
+    return ''.join(result).lower().strip()
+
+def _np_clean(s):
+    if s is None:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    result = _np_to_ascii(s)
+    if result is None:
+        return None
+    result = result.replace(',', '').replace(';', '')
+    result = re.sub(r'\s+', ' ', result).strip()
+    if not result:
+        return None
+    return result
+
+# ── Constants ──
+
+_NP_COMPOUND_PREFIXES = frozenset([
+    'de', 'del', 'della', 'di', 'da', 'das', 'do', 'dos',
+    'van', 'von', 'der', 'den', 'het', 'la', 'le', 'les', 'el',
+    'al', 'al-', 'bin', 'ibn', 'abu', 'e', 'i',
+])
+
+# ── Particle strip for matching key ──
+#
+# Strips leading surname particles (de, da, van der, etc.) from parsed_name.last
+# so matching treats "de Oliveira" and "Oliveira" as the same surname. Raw
+# strings stay untouched — only the matching/blocking key changes. See
+# oxjobs/working/split-authors-name-parser/PLAN-surname-particle-parser-fix.md.
+
+_STRIP_PARTICLES_SINGLE = frozenset({
+    'de', 'da', 'do', 'dos', 'das', 'del',
+    'van', 'von', 'zu',
+})
+
+_STRIP_PARTICLES_TWO = frozenset({
+    ('de', 'la'), ('de', 'las'), ('de', 'los'),
+    ('van', 'de'), ('van', 'der'), ('van', 'den'),
+})
+
+def _strip_surname_particles(last):
+    if not last:
+        return last
+    tokens = last.split()
+    if len(tokens) < 2:
+        return last
+    if len(tokens) >= 3 and (tokens[0], tokens[1]) in _STRIP_PARTICLES_TWO:
+        return ' '.join(tokens[2:])
+    if tokens[0] in _STRIP_PARTICLES_SINGLE:
+        return ' '.join(tokens[1:])
+    return last
+
+_NP_TITLE_PATTERNS = [
+    (re.compile(r'^prof\.?\s+dr\.?\s+', re.IGNORECASE), 'prof. dr.'),
+    (re.compile(r'^prof\.?\s+', re.IGNORECASE), 'prof.'),
+    (re.compile(r'^dr\.?\s+', re.IGNORECASE), 'dr.'),
+    (re.compile(r'^ir\.?\s+', re.IGNORECASE), 'ir.'),
+    (re.compile(r'^dra\.?\s+', re.IGNORECASE), 'dra.'),
+    (re.compile(r'^ing\.?\s+', re.IGNORECASE), 'ing.'),
+]
+
+_NP_ORG_KEYWORDS = [
+    'institute', 'university', 'ministry', 'society', 'department',
+    'academy', 'foundation', 'laboratory', 'board', 'commission',
+    'journal', 'program studi', 'pontificia', 'escuela', 'ministerio',
+    'editorial', 'office', 'council', 'committee', 'association',
+    'corporation', 'company', 'group', 'center', 'centre',
+]
+
+# ── Post-nominal credentials ──
+# Curated for OpenAlex's multilingual corpus. nameparser's SUFFIX_ACRONYMS
+# (609 entries) is deliberately NOT used — it collides heavily with surnames
+# in our data: Mba (Igbo), Rai (Indian), Mai (Vietnamese), Abd (Arabic/Malay),
+# Cfp, Mfa, Cha, Chi, Sa, Ra, Pt, Ot, and many more.
+#
+# This list covers the common academic/medical/professional credentials that
+# actually appear in author names, excluding anything that overlaps with
+# known surname patterns. Short (<=2 char) entries rely on the all-caps /
+# comma-before guard in _np_strip_credentials to avoid eating surnames.
+
+_NP_CREDENTIAL_ACRONYMS = frozenset([
+    # Doctoral
+    'phd', 'dphil', 'drph', 'scd', 'edd', 'psyd',
+    'pharmd', 'mbbs', 'mbchb', 'dvm', 'dds', 'dmd', 'dnp', 'dpt',
+    # Masters (unambiguous only)
+    'msc', 'mph', 'mscn', 'msn', 'mpp', 'mhs',
+    # Law
+    'llm', 'jd',
+    # Social work / clinical
+    'lcsw',
+    # Medical/board fellowships
+    'facs', 'facp', 'facog', 'faap', 'fccp', 'faan',
+    'frcp', 'frcs', 'frcpc', 'frcog', 'mrcp', 'mrcs',
+    'fcps',
+    # Nursing
+    'rn', 'crna', 'fnp',
+    # Short (<=2 char) — require comma or all-caps via the stripper's guard
+    'md', 'do',
+])
+
+# Credentials accepted ONLY in dotted form (M.S., M.A., M.B.A., M.F.A.).
+# The internal dots disambiguate them from bare-letter forms which collide
+# with surnames (Ma, Mba) or initials (MS, MA).
+_NP_DOTTED_ONLY_CREDS = frozenset(['ms', 'ma', 'mba', 'mfa', 'ba', 'bs'])
+
+# Generational markers — excluded from the credential stripper so the existing
+# suffix regex handles them (preserving original casing for "Jr." etc.).
+_NP_GENERATIONAL = frozenset(['jr', 'sr', 'ii', 'iii', 'iv', 'v', 'esq'])
+
+_CRED_RE = re.compile(r'(,\s*|\s+)([A-Za-z][A-Za-z.]*\.?)\s*$')
+
+def _np_acronym_shape(s):
+    """Cred-shape heuristic for unknown acronyms (MBA, MFA, FRACP, FAHMS, ...).
+    All-caps and mixed-case both 2-6 chars; mixed-case requires >=2 uppercase
+    (PhD, MSc, PharmD). All-caps given names (JAMES, JOHN) are protected by
+    the strip's anchor requirement: an unknown acronym is only stripped if
+    a whitelisted credential exists in the same comma-list.
+    """
+    L = len(s)
+    if L < 2 or L > 6 or not s[0].isupper():
+        return False
+    if s.isupper():
+        return True
+    caps = sum(1 for c in s if c.isupper())
+    return caps >= 2
+
+
+def _np_mid_is_credential_token(tok):
+    """Mid-stream cred check — used inside mixed comma segments.
+    Rejects mixed-case 'Md.' (name token in 'Alam Md. Mahbub').
+    Accepts all-caps 'MBA' / 'MD' / 'DVM' and dotted 'M.D.' / 'M.B.A.'.
+    """
+    raw_no_dot = tok.replace('.', '')
+    norm = raw_no_dot.lower()
+    has_internal_dots = '.' in tok[:-1]
+    is_short = len(norm) <= 2
+    is_wl_base = (
+        norm in _NP_CREDENTIAL_ACRONYMS
+        or (has_internal_dots and norm in _NP_DOTTED_ONLY_CREDS)
+        or (raw_no_dot.isupper() and norm in _NP_DOTTED_ONLY_CREDS)
+    )
+    if not is_wl_base:
+        return False
+    if is_short:
+        return has_internal_dots or raw_no_dot.isupper()
+    return True
+
+
+def _np_segment_is_credential(seg_tokens):
+    """Whole-segment cred check — used to DROP a comma segment.
+    Looser than mid-stream: a bare 'Md' alone between commas is a credential
+    (real names don't appear as a single token 'Md' between commas).
+    """
+    for tok in seg_tokens:
+        raw_no_dot = tok.replace('.', '')
+        norm = raw_no_dot.lower()
+        has_internal_dots = '.' in tok[:-1]
+        is_wl_base = (
+            norm in _NP_CREDENTIAL_ACRONYMS
+            or (has_internal_dots and norm in _NP_DOTTED_ONLY_CREDS)
+            or (raw_no_dot.isupper() and norm in _NP_DOTTED_ONLY_CREDS)
+        )
+        if not is_wl_base:
+            return False
+    return True
+
+
+def _np_drop_credential_segments(r):
+    """Drop comma segments that are purely credentials; also strip cred tokens
+    inside mixed segments (mid-stream) when >=2 name tokens survive.
+
+    Fixes:
+      - 'Davatzikos, PhD, Christos'      -> drops PhD segment
+      - 'DeLong, Md, Facp, Douglas M.'   -> drops Md and Facp segments
+      - 'Matsuura DVM Yoshiharu'         -> drops DVM mid-stream
+      - 'John M. Harris Jr MD MBA'       -> drops MD, MBA mid-stream (all-caps)
+      - 'Prof. Dr Smith, MD, PhD'        -> drops MD, PhD segments
+    Preserves:
+      - 'Alam Md. Mahbub'                -> 'Md.' mixed case kept as name
+      - 'Dang V Do' / 'Ron Do'           -> 'Do' short + mixed case kept
+    """
+    if not r:
+        return r
+    segments = [s.strip() for s in r.split(',')]
+    kept = []
+    for seg in segments:
+        if not seg:
+            continue
+        tokens = seg.split()
+        if not tokens:
+            continue
+        if _np_segment_is_credential(tokens):
+            continue
+        non_cred = [t for t in tokens if not _np_mid_is_credential_token(t)]
+        first_was_cred = _np_mid_is_credential_token(tokens[0])
+        if 2 <= len(non_cred) < len(tokens):
+            # Standard mid-stream strip — >=2 name tokens survive.
+            seg = ' '.join(non_cred)
+        elif len(non_cred) == 1 and first_was_cred and len(tokens) >= 2:
+            # Credential-prefix pattern ('Phd Chiara', 'Msc Maricela', etc.).
+            # No one is actually named 'PhD' / 'MSc' — safe to drop leading
+            # creds even if only 1 name token remains.
+            seg = ' '.join(non_cred)
+        kept.append(seg)
+    return ', '.join(kept)
+
+
+def _np_strip_credentials(r, existing_suffix):
+    """Strip trailing credentials and return (stripped_name, updated_suffix).
+
+    Two-phase algorithm:
+      Phase 1 (probe): walk right-to-left over trailing comma/space-separated
+        tokens. Collect candidates that are EITHER whitelisted credentials
+        OR comma-adjacent acronym-shaped tokens (MBA, MFA, XYZ). Don't
+        modify r yet.
+      Phase 2 (commit): find the deepest whitelisted credential in the
+        candidate list. Commit all candidates up to and including that one.
+        If no whitelisted credential was found, commit nothing — we won't
+        strip unknowns on their own.
+
+    This means:
+      - "Derek Banyard, MD, MS, MBA" -> all three stripped (MD whitelisted,
+        MS and MBA accepted via acronym shape in comma list)
+      - "Smith, JOHN" -> JOHN not stripped (no whitelisted cred to anchor)
+      - "Smith, FACS, XYZ" -> both stripped (FACS whitelisted, XYZ accepted)
+
+    Short (<=2 char) whitelisted entries still require comma-before or
+    all-caps to avoid eating surnames like "Ma" or "Do".
+    """
+    candidates = []  # list of (remainder_after_strip, norm, is_whitelisted)
+    probe = r
+    for _ in range(8):
+        m = _CRED_RE.search(probe)
+        if not m:
+            break
+        sep = m.group(1)
+        token = m.group(2)
+        raw_no_dot = token.replace('.', '')
+        norm = raw_no_dot.lower()
+
+        if norm in _NP_GENERATIONAL:
+            break
+
+        has_internal_dot = '.' in token[:-1]  # dot before final position
+        is_wl = norm in _NP_CREDENTIAL_ACRONYMS or (
+            has_internal_dot and norm in _NP_DOTTED_ONLY_CREDS
+        )
+        # Dotted shape-like tokens of length >=4 (e.g. B.Tech., M.Tech.) count as
+        # whitelisted for anchor purposes — internal dots are a strong cred signal.
+        if not is_wl and has_internal_dot and _np_acronym_shape(raw_no_dot) and len(raw_no_dot) >= 4:
+            is_wl = True
+        if is_wl:
+            # Short (<=2 char) creds need a guard to avoid eating surnames
+            # (Ma, Do, Ha, Sa). Exempted when:
+            #   - norm == 'md' (not a surname in any language we see)
+            #   - token has internal dots (M.S., M.A. — dots disambiguate)
+            if len(norm) <= 2 and norm != 'md' and not has_internal_dot:
+                has_comma = ',' in sep
+                all_caps = raw_no_dot.isupper()
+                if not (has_comma or all_caps):
+                    break
+        elif _np_acronym_shape(raw_no_dot):
+            pass  # accept as shape-like; commit anchor still requires a whitelisted cred
+        else:
+            break
+
+        remainder = probe[:m.start()].rstrip(', \t').strip()
+        candidates.append((remainder, norm, is_wl))
+        probe = remainder
+
+    last_wl = -1
+    for i, (_, _, is_wl) in enumerate(candidates):
+        if is_wl:
+            last_wl = i
+    if last_wl < 0:
+        return r, existing_suffix
+
+    committed = candidates[:last_wl + 1]
+    creds = [c[1] for c in committed][::-1]  # reverse: natural reading order
+    r = committed[-1][0]
+    combined = ', '.join(creds)
+    if existing_suffix:
+        return r, f"{existing_suffix}, {combined}"
+    return r, combined
+
+
+
+# ── Cyrillic/Latin look-alikes ──
+
+_LATIN_TO_CYRILLIC = {
+    'A': 'А', 'B': 'В', 'C': 'С', 'E': 'Е', 'H': 'Н', 'K': 'К',
+    'M': 'М', 'O': 'О', 'P': 'Р', 'T': 'Т', 'X': 'Х',
+    'a': 'а', 'c': 'с', 'e': 'е', 'o': 'о', 'p': 'р', 'x': 'х',
+}
+_CYRILLIC_TO_LATIN = {v: k for k, v in _LATIN_TO_CYRILLIC.items()}
+
+def _np_fix_latin_lookalikes(s):
+    return ''.join(_LATIN_TO_CYRILLIC.get(c, c) for c in s)
+
+def _np_fix_cyrillic_lookalikes(s):
+    return ''.join(_CYRILLIC_TO_LATIN.get(c, c) for c in s)
+
+# ── CJK surname data (inline) ──
+# Loaded from Databricks census tables — too large to inline fully,
+# so we load from the catalog at import time if available, else use empty sets.
+
+def _load_surname_set(filename):
+    with resources.files(__package__).joinpath("data", filename).open(encoding="utf-8") as f:
+        return set(json.load(f))
+
+try:
+    _NP_CHINESE_SURNAMES = _load_surname_set("chinese_surnames.json")
+except Exception:
+    _NP_CHINESE_SURNAMES = set()
+
+try:
+    _NP_JAPANESE_SURNAMES = _load_surname_set("japanese_surnames.json")
+except Exception:
+    _NP_JAPANESE_SURNAMES = set()
+
+# ── Korean surname data ──
+
+_NP_KOREAN_SURNAME_MAP = {
+    '김': 'kim', '이': 'lee', '박': 'park', '최': 'choi', '정': 'jeong',
+    '강': 'kang', '조': 'jo', '윤': 'yun', '장': 'jang', '임': 'lim',
+    '한': 'han', '오': 'oh', '서': 'seo', '신': 'shin', '권': 'kwon',
+    '황': 'hwang', '안': 'ahn', '송': 'song', '전': 'jeon', '홍': 'hong',
+    '유': 'yu', '고': 'go', '문': 'moon', '양': 'yang', '손': 'son',
+    '배': 'bae', '백': 'baek', '허': 'heo', '남': 'nam', '심': 'sim',
+    '노': 'noh', '하': 'ha', '곽': 'kwak', '성': 'seong', '차': 'cha',
+    '주': 'ju', '우': 'woo', '구': 'gu', '민': 'min', '진': 'jin',
+    '지': 'ji', '엄': 'eom', '채': 'chae', '류': 'ryu',
+}
+
+_NP_KOREAN_ROMANIZED_SURNAMES = frozenset([
+    'kim', 'lee', 'park', 'choi', 'jung', 'jeong', 'kang', 'cho', 'jo',
+    'yoon', 'yun', 'jang', 'chang', 'lim', 'im', 'han', 'oh', 'seo',
+    'shin', 'kwon', 'hwang', 'ahn', 'an', 'song', 'jeon', 'chun', 'hong',
+    'yu', 'yoo', 'ko', 'go', 'moon', 'yang', 'son', 'bae', 'baek',
+    'heo', 'hur', 'nam', 'sim', 'noh', 'roh', 'ha', 'kwak', 'seong',
+    'sung', 'cha', 'joo', 'ju', 'woo', 'koo', 'ku', 'gu', 'min',
+    'jin', 'ji', 'eom', 'um', 'chae', 'ryu', 'yoo', 'hyun', 'chung',
+    'shin', 'sohn', 'shim', 'paik', 'pae', 'byun', 'byeon',
+])
+
+# Conservative Chinese pinyin surnames (48) used for 2-token Latin order detection.
+# Excludes pinyin that collides with Western given names / English words:
+#   ma, he, lin, han, lu, bai, mu, bo, yu, wu, jin, cai, wen, shi
+_NP_CHINESE_ROMANIZED_SURNAMES = frozenset([
+    'wang', 'li', 'zhang', 'liu', 'chen', 'yang', 'huang', 'zhao', 'zhou',
+    'xu', 'sun', 'zhu', 'hu', 'guo', 'gao', 'luo',
+    'zheng', 'liang', 'xie', 'song', 'tang', 'feng', 'deng', 'cao', 'peng',
+    'zeng', 'xiao', 'tian', 'pan', 'yuan', 'jiang', 'dong', 'jia', 'ding',
+    'shen', 'wei', 'meng', 'qian', 'yan', 'dai', 'du',
+    'fu', 'zhong', 'kong', 'cui', 'qiu', 'lei', 'yao',
+])
+
+# ── Cyrillic patronymic endings ──
+
+_NP_PATRONYMIC_ENDINGS = (
+    'ович', 'евич', 'ивич', 'овна', 'евна', 'ивна',
+    'овича', 'евича', 'івна', 'іївна', 'ївна', 'ійович',
+)
+
+# ── Output helper ──
+
+def _np_out(title=None, first=None, middle=None, last=None, suffix=None,
+            nickname=None, confidence='high'):
+    return {
+        "title": title, "first": first, "middle": middle,
+        "last": last, "suffix": suffix, "nickname": nickname,
+        "confidence": confidence,
+    }
+
+# ── CJK parsers ──
+
+def _np_is_likely_japanese(name):
+    chars = name.replace(' ', '')
+    if not chars:
+        return False
+    for length in [2, 3, 1]:
+        if length <= len(chars):
+            candidate = chars[:length]
+            if candidate in _NP_JAPANESE_SURNAMES:
+                if length >= 2:
+                    return True
+                if candidate not in _NP_CHINESE_SURNAMES:
+                    return True
+    return False
+
+def _np_pykakasi_romanize(text):
+    global _kks
+    if _kks is None:
+        if _kakasi is None:
+            return text
+        _kks = _kakasi()
+    results = _kks.convert(text)
+    rom = ''.join(r['hepburn'] for r in results).strip()
+    rom = rom.replace('uu', 'u').replace('ou', 'o')
+    return rom
+
+def _np_parse_cjk(raw):
+    r = raw.strip()
+    has_kana = any(0x3040 <= ord(c) <= 0x30FF for c in r)
+    if has_kana:
+        return _np_parse_japanese(r)
+    if _np_is_likely_japanese(r):
+        return _np_parse_japanese(r)
+    return _np_parse_chinese(r)
+
+def _np_parse_japanese(raw):
+    global _kks
+    if _kks is None:
+        if _kakasi is None:
+            return _np_out(confidence='low')
+        _kks = _kakasi()
+    r = raw.strip()
+    if ' ' in r:
+        parts = r.split(None, 1)
+        p1_is = parts[0] in _NP_JAPANESE_SURNAMES
+        p2_is = parts[1] in _NP_JAPANESE_SURNAMES
+        if p2_is and not p1_is:
+            family_part, given_part = parts[1], parts[0]
+        else:
+            family_part, given_part = parts[0], parts[1]
+        family_rom = _np_pykakasi_romanize(family_part)
+        given_rom = _np_pykakasi_romanize(given_part)
+        conf = 'medium' if (p1_is or p2_is) else 'low'
+        return _np_out(first=_np_clean(given_rom), last=_np_clean(family_rom), confidence=conf)
+    else:
+        results = _kks.convert(r)
+        romanized = [x['hepburn'] for x in results if x['hepburn'].strip()]
+        if len(romanized) >= 2:
+            return _np_out(first=_np_clean(' '.join(romanized[1:])),
+                           last=_np_clean(romanized[0]), confidence='medium')
+        elif len(romanized) == 1:
+            return _np_out(last=_np_clean(romanized[0]), confidence='low')
+        return _np_out(confidence='low')
+
+def _np_parse_chinese(raw):
+    r = raw.strip()
+    pinyin = _unidecode(r).strip()
+    pinyin = re.sub(r'\s+', ' ', pinyin).strip()
+    tokens = pinyin.split()
+    if not tokens:
+        return _np_out(confidence='low')
+    surname = _np_clean(tokens[0])
+    given = _np_clean(''.join(tokens[1:])) if len(tokens) > 1 else None
+    return _np_out(first=given, last=surname, confidence='medium')
+
+def _np_safe_korean_romanize(text):
+    """Romanize Korean text, falling back to unidecode if korean_romanizer crashes."""
+    if not text:
+        return None
+    if _Romanizer is not None:
+        try:
+            return _Romanizer(text).romanize().strip()
+        except (KeyError, Exception):
+            pass
+    return _unidecode(text).strip()
+
+def _np_parse_hangul(raw):
+    r = raw.strip()
+    chars = list(r.replace(' ', ''))
+    if not chars:
+        return _np_out()
+    surname_char = chars[0]
+    given_chars = ''.join(chars[1:])
+    surname_rom = _NP_KOREAN_SURNAME_MAP.get(surname_char)
+    if surname_rom is None:
+        surname_rom = _np_safe_korean_romanize(surname_char)
+    given_rom = _np_safe_korean_romanize(given_chars) if given_chars else None
+    return _np_out(first=_np_clean(given_rom), last=_np_clean(surname_rom), confidence='medium')
+
+def _np_parse_cyrillic(raw):
+    r = raw.strip()
+    tokens = r.split()
+    if len(tokens) == 3:
+        last_tok = tokens[-1]
+        if any(last_tok.endswith(end) for end in _NP_PATRONYMIC_ENDINGS):
+            return _np_out(first=_np_clean(_unidecode(tokens[1])),
+                           middle=_np_clean(_unidecode(tokens[2])),
+                           last=_np_clean(_unidecode(tokens[0])), confidence='medium')
+        mid_tok = tokens[1]
+        if any(mid_tok.endswith(end) for end in _NP_PATRONYMIC_ENDINGS):
+            return _np_out(first=_np_clean(_unidecode(tokens[0])),
+                           middle=_np_clean(_unidecode(tokens[1])),
+                           last=_np_clean(_unidecode(tokens[2])), confidence='medium')
+    romanized = _unidecode(r)
+    result = _np_parse_latin(romanized)
+    if result['confidence'] == 'high':
+        result['confidence'] = 'medium'
+    return result
+
+_NP_ARABIC_MAP = {
+    'ا': 'a', 'أ': 'a', 'إ': 'i', 'آ': 'a',
+    'ب': 'b', 'ت': 't', 'ث': 'th',
+    'ج': 'j', 'ح': 'h', 'خ': 'kh',
+    'د': 'd', 'ذ': 'dh',
+    'ر': 'r', 'ز': 'z',
+    'س': 's', 'ش': 'sh',
+    'ص': 's', 'ض': 'd',
+    'ط': 't', 'ظ': 'z',
+    'ع': 'a', 'غ': 'gh',
+    'ف': 'f', 'ق': 'q',
+    'ك': 'k', 'ک': 'k',
+    'ل': 'l', 'م': 'm', 'ن': 'n',
+    'ه': 'h', 'ة': 'a',
+    'و': 'w', 'ي': 'y', 'ى': 'a',
+    'ئ': 'i', 'ؤ': 'u',
+    'ء': '',
+    'پ': 'p', 'چ': 'ch', 'ژ': 'zh', 'گ': 'g',
+    'ی': 'y',
+    '\u064e': 'a', '\u064f': 'u', '\u0650': 'i',
+    '\u0651': '', '\u0652': '',
+}
+
+def _np_arabic_romanize(text):
+    result = []
+    for c in text:
+        if c in _NP_ARABIC_MAP:
+            result.append(_NP_ARABIC_MAP[c])
+        elif c == ' ':
+            result.append(' ')
+        elif c in ('-', '/'):
+            result.append(' ')
+        elif ord(c) < 128:
+            result.append(c)
+    rom = ''.join(result)
+    rom = re.sub(r'\s+', ' ', rom).strip()
+    return rom
+
+def _np_parse_arabic(raw):
+    r = raw.strip()
+    romanized = _np_arabic_romanize(r)
+    if not romanized or not any(c.isalpha() for c in romanized):
+        return _np_out(confidence='low')
+    result = _np_parse_latin(romanized)
+    result['confidence'] = 'medium'
+    return result
+
+# ── Latin parser ──
+
+def _np_parse_latin(name):
+    r = name.strip()
+    r = re.sub(r'\s+\d{4}-\s*$', '', r)
+    r = re.sub(r';\s*id_orcid\s+[\d-]+', '', r)
+    r = re.sub(r'id_orcid\s+[\d-]+', '', r)
+    r = re.sub(r'(\w)\d+([,\s])', r'\1\2', r)
+    r = re.sub(r'(\w)\d+$', r'\1', r)
+    r = r.replace('\u2010', '-').replace('\u2011', '-').replace('\u2012', '-')
+    r = r.replace('\u2013', '-').replace('\u2014', '-').replace('\u2015', '-')
+    r = re.sub(r'-\s+', '-', r)
+    r = re.sub(r'\s+-', '-', r)
+    r = re.sub(r'\s*-\s*$', '', r)
+    r = re.sub(r'^\s*-\s*', '', r)
+    r = re.sub(r'\s+', ' ', r).strip()
+
+    # Drop comma segments that are pure credentials + mid-stream cred tokens
+    # before any first/last role assignment.
+    r = _np_drop_credential_segments(r)
+
+    # Strip credentials BEFORE the dot-split, so trailing 'M.D.' / 'Ph.D.' /
+    # 'M.S.' tokens are matched in compact form (the dot-split below would
+    # otherwise turn 'M.D.' into 'M. D.' which the strip can't reassemble).
+    r, _early_cred_suffix = _np_strip_credentials(r, None)
+
+    r = re.sub(r'\.([A-Z])', r'. \1', r)
+
+    r_lower = r.lower()
+    for kw in _NP_ORG_KEYWORDS:
+        if kw in r_lower:
+            return _np_out(last=_np_clean(r))
+
+    if ';' in r:
+        parts = r.split(';')
+        if len(parts) >= 2 and len(parts[0].strip().split()) >= 2 and len(parts[1].strip().split()) >= 2:
+            r = parts[0].strip()
+    et_al_match = re.search(r'\bet\s+al\.?\s*$', r, re.IGNORECASE)
+    if et_al_match:
+        r = r[:et_al_match.start()].strip()
+    r = r.replace(';', '').strip()
+    r = re.sub(r'\s+', ' ', r)
+
+    nickname = None
+    nick_match = re.search(r'\s*[\(\[](.*?)[\)\]]', r)
+    if nick_match:
+        nickname = _np_clean(nick_match.group(1))
+        r = r[:nick_match.start()] + r[nick_match.end():]
+        r = re.sub(r'\s+', ' ', r).strip()
+
+    title = None
+    for pattern, title_val in _NP_TITLE_PATTERNS:
+        m = pattern.match(r)
+        if m:
+            title = title_val
+            r = r[m.end():].strip()
+            break
+
+    suffix = None
+    suffix_match = re.search(r',?\s+(Jr\.?|Junior|Júnior|Sr\.?|III|IV|II|Esq\.?)$', r, re.IGNORECASE)
+    if suffix_match:
+        suffix = _np_clean(suffix_match.group(1))
+        r = r[:suffix_match.start()].strip()
+
+    r, suffix = _np_strip_credentials(r, suffix)
+    if _early_cred_suffix:
+        suffix = f"{suffix}, {_early_cred_suffix}" if suffix else _early_cred_suffix
+
+    # Re-run generational suffix regex in case a generational marker sat
+    # between name and credentials (e.g. "Smith Jr., MD" -> strip MD -> Jr. now at end).
+    if suffix_match is None or (suffix and ',' in suffix):
+        suffix_match2 = re.search(r',?\s+(Jr\.?|Junior|Júnior|Sr\.?|III|IV|II|Esq\.?)$', r, re.IGNORECASE)
+        if suffix_match2:
+            gen = _np_clean(suffix_match2.group(1))
+            r = r[:suffix_match2.start()].strip()
+            suffix = f"{gen}, {suffix}" if suffix else gen
+
+    if ',' in r:
+        parts = r.split(',', 1)
+        last_part = parts[0].strip()
+        first_part = parts[1].strip()
+        if first_part:
+            ftokens = first_part.split()
+            first = _np_clean(ftokens[0])
+            middle = _np_clean(' '.join(ftokens[1:])) if len(ftokens) > 1 else None
+        else:
+            first, middle = None, None
+        return _np_out(title=title, first=first, middle=middle, last=_np_clean(last_part),
+                       suffix=suffix, nickname=nickname, confidence='high')
+
+    r = re.sub(r'\b([A-Z])\.-([A-Z])\.', r'\1. \2.', r)
+    tokens = r.split()
+
+    if len(tokens) == 0:
+        return _np_out(last=_np_clean(r), suffix=suffix, nickname=nickname)
+    if len(tokens) == 1:
+        return _np_out(title=title, last=_np_clean(tokens[0]), suffix=suffix,
+                       nickname=nickname, confidence='high')
+
+    if len(tokens) == 2:
+        t0_lower = tokens[0].lower().rstrip('.')
+        t1_lower = tokens[1].lower().rstrip('.')
+        if t0_lower in _NP_KOREAN_ROMANIZED_SURNAMES and '-' in tokens[1]:
+            return _np_out(title=title, first=_np_clean(tokens[1]), last=_np_clean(tokens[0]),
+                           suffix=suffix, nickname=nickname, confidence='high')
+        if t1_lower in _NP_KOREAN_ROMANIZED_SURNAMES and '-' in tokens[0]:
+            return _np_out(title=title, first=_np_clean(tokens[0]), last=_np_clean(tokens[1]),
+                           suffix=suffix, nickname=nickname, confidence='high')
+        # Chinese pinyin surname order detection (conservative — unambiguous surnames only).
+        # Asymmetric: flip only when exactly one token is a known pinyin surname,
+        # so "Li Yang" / "Yang Li" (both surnames) stays at the default and remains ambiguous.
+        if t0_lower in _NP_CHINESE_ROMANIZED_SURNAMES and t1_lower not in _NP_CHINESE_ROMANIZED_SURNAMES:
+            return _np_out(title=title, first=_np_clean(tokens[1]), last=_np_clean(tokens[0]),
+                           suffix=suffix, nickname=nickname, confidence='high')
+        if t1_lower in _NP_CHINESE_ROMANIZED_SURNAMES and t0_lower not in _NP_CHINESE_ROMANIZED_SURNAMES:
+            return _np_out(title=title, first=_np_clean(tokens[0]), last=_np_clean(tokens[1]),
+                           suffix=suffix, nickname=nickname, confidence='high')
+        return _np_out(title=title, first=_np_clean(tokens[0]), last=_np_clean(tokens[1]),
+                       suffix=suffix, nickname=nickname, confidence='high')
+
+    surname_start = len(tokens) - 1
+    found_prefix = False
+    while surname_start > 1:
+        prev_tok = tokens[surname_start - 1]
+        prev_stripped = prev_tok.rstrip('.')
+        if len(prev_stripped) == 1 and prev_stripped[0].isupper():
+            break
+        if prev_stripped.lower() in _NP_COMPOUND_PREFIXES:
+            surname_start -= 1
+            found_prefix = True
+        else:
+            break
+
+    conf = 'high' if found_prefix else 'medium'
+    first = _np_clean(tokens[0])
+    if surname_start == 1:
+        return _np_out(title=title, first=first, last=_np_clean(' '.join(tokens[1:])),
+                       suffix=suffix, nickname=nickname, confidence=conf)
+    middle = _np_clean(' '.join(tokens[1:surname_start]))
+    last = _np_clean(' '.join(tokens[surname_start:]))
+    return _np_out(title=title, first=first, middle=middle, last=last,
+                   suffix=suffix, nickname=nickname, confidence=conf)
+
+# ── Main entry point ──
+
+def _np_parse_name(raw_author_name):
+    """New deterministic parser. Returns dict with confidence field."""
+    if not raw_author_name or not raw_author_name.strip():
+        return _np_out()
+    r = raw_author_name.strip()
+
+    latin_alpha_count = sum(1 for c in r if c.isalpha() and ord(c) < 128)
+    nonlatin_alpha_count = sum(1 for c in r if c.isalpha() and ord(c) >= 128)
+    mostly_nonlatin = nonlatin_alpha_count > latin_alpha_count * 3
+
+    if not _np_has_latin_alpha(r) or mostly_nonlatin:
+        fixed = _np_fix_latin_lookalikes(r) if mostly_nonlatin else r
+        if _np_has_cjk(fixed):
+            return _np_parse_cjk(fixed)
+        if _np_has_hangul(fixed):
+            return _np_parse_hangul(fixed)
+        if _np_has_cyrillic(fixed):
+            return _np_parse_cyrillic(fixed)
+        if _np_has_arabic(fixed):
+            return _np_parse_arabic(fixed)
+        return _np_out(last=_np_clean(fixed))
+
+    if _np_has_cjk(r) or _np_has_hangul(r):
+        latin_part = ''.join(c if (ord(c) < 128 or c in '-. ') else ' ' for c in r).strip()
+        latin_part = re.sub(r'\s+', ' ', latin_part).strip()
+        if latin_part:
+            return _np_parse_latin(latin_part)
+        return _np_out(confidence='low')
+
+    if _np_has_cyrillic(r):
+        fixed = _np_fix_cyrillic_lookalikes(r)
+        if _np_has_latin_alpha(fixed) and not _np_has_cyrillic(fixed):
+            return _np_parse_latin(fixed)
+        latin_part = ''.join(c if (ord(c) < 128 or c in '-. ') else ' ' for c in fixed).strip()
+        latin_part = re.sub(r'\s+', ' ', latin_part).strip()
+        if latin_part:
+            return _np_parse_latin(latin_part)
+        return _np_out(confidence='low')
+
+    if _np_has_arabic(r):
+        latin_part = ''.join(c if (ord(c) < 128 or c in '-. ') else ' ' for c in r).strip()
+        latin_part = re.sub(r'\s+', ' ', latin_part).strip()
+        if latin_part:
+            return _np_parse_latin(latin_part)
+        return _np_out(confidence='low')
+
+    return _np_parse_latin(r)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Router: new parser with HNP fallback for low confidence
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_human_name(name):
+    """
+    Parse a name using the new deterministic parser (v2.2).
+    Falls back to HNP when confidence is low.
+    Returns dict with: title, first, middle, last, suffix, nickname.
+    Values are strings (empty string for missing, matching original convention).
+    """
+    result = _np_parse_name(name)
+    if result['confidence'] == 'low':
+        result = parse_human_name_hnp(name)
+
+    last = _strip_surname_particles(result.get('last') or '')
+
+    return {
+        'title': result.get('title') or '',
+        'first': result.get('first') or '',
+        'middle': result.get('middle') or '',
+        'last': last,
+        'suffix': result.get('suffix') or '',
+        'nickname': result.get('nickname') or '',
+    }
+
+
+
+
+# ── CLI ──
+
+def _cli():
+    """Parse a name from argv, or JSONL/plain names from stdin."""
+    import sys
+    if len(sys.argv) > 1:
+        print(json.dumps(_np_parse_name(' '.join(sys.argv[1:])), ensure_ascii=False, indent=2))
+        return
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            rec = json.loads(raw_line)
+            raw = rec.get('raw_author_name', raw_line)
+        except json.JSONDecodeError:
+            raw = raw_line
+        result = _np_parse_name(raw)
+        result['raw_author_name'] = raw
+        print(json.dumps(result, ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    _cli()
