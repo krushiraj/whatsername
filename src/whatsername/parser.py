@@ -585,6 +585,56 @@ _NP_CHINESE_ROMANIZED_SURNAMES = frozenset([
     'fu', 'zhong', 'kong', 'cui', 'qiu', 'lei', 'yao',
 ])
 
+# ── Pinyin syllables ──
+# Standard Mandarin syllables without tone marks, written out by initial. A token
+# that splits cleanly into one to four of them ("jianling", "shu-hui", "zhibing")
+# reads as romanised Chinese; "bankole" and "nikolai" do not.
+
+_PINYIN_BY_INITIAL = {
+    '': 'a ai an ang ao e ei en eng er o ou',
+    'b': 'a ai an ang ao ei en eng i ian iao ie in ing o u',
+    'p': 'a ai an ang ao ei en eng i ian iao ie in ing o ou u',
+    'm': 'a ai an ang ao e ei en eng i ian iao ie in ing iu o ou u',
+    'f': 'a an ang ei en eng o ou u',
+    'd': 'a ai an ang ao e ei en eng i ia ian iao ie ing iu ong ou u uan ui un uo',
+    't': 'a ai an ang ao e eng i ian iao ie ing ong ou u uan ui un uo',
+    'n': 'a ai an ang ao e ei en eng i ian iang iao ie in ing iu ong ou u uan uo v ve',
+    'l': 'a ai an ang ao e ei eng i ia ian iang iao ie in ing iu ong ou u uan un uo v ve',
+    'g': 'a ai an ang ao e ei en eng ong ou u ua uai uan uang ui un uo',
+    'k': 'a ai an ang ao e en eng ong ou u ua uai uan uang ui un uo',
+    'h': 'a ai an ang ao e ei en eng ong ou u ua uai uan uang ui un uo',
+    'j': 'i ia ian iang iao ie in ing iong iu u uan ue un',
+    'q': 'i ia ian iang iao ie in ing iong iu u uan ue un',
+    'x': 'i ia ian iang iao ie in ing iong iu u uan ue un',
+    'zh': 'a ai an ang ao e ei en eng i ong ou u ua uai uan uang ui un uo',
+    'ch': 'a ai an ang ao e en eng i ong ou u ua uai uan uang ui un uo',
+    'sh': 'a ai an ang ao e ei en eng i ou u ua uai uan uang ui un uo',
+    'r': 'an ang ao e en eng i ong ou u uan ui un uo',
+    'z': 'a ai an ang ao e ei en eng i ong ou u uan ui un uo',
+    'c': 'a ai an ang ao e en eng i ong ou u uan ui un uo',
+    's': 'a ai an ang ao e en eng i ong ou u uan ui un uo',
+    'y': 'a an ang ao e i in ing ong ou u uan ue un',
+    'w': 'a ai an ang ei en eng o u',
+}
+_NP_PINYIN_SYLLABLES = frozenset(
+    initial + final for initial, finals in _PINYIN_BY_INITIAL.items() for final in finals.split()
+)
+_NP_PINYIN_MAX_SYLLABLES = 4
+_PINYIN_GIVEN_GUARD = 5.0  # "Lu Anna": a clearly Western given name that happens to spell pinyin
+
+def _np_pinyin_segmentable(token):
+    """True when ``token`` splits into 1-4 pinyin syllables (hyphens and apostrophes are free breaks)."""
+    word = re.sub(r"[-'\s]", '', token.lower())
+    if not word.isalpha() or not word.isascii():
+        return False
+    # best[i] = fewest syllables that spell word[:i]
+    best = [0] + [99] * len(word)
+    for i in range(1, len(word) + 1):
+        for j in range(max(0, i - 6), i):
+            if best[j] < 99 and word[j:i] in _NP_PINYIN_SYLLABLES:
+                best[i] = min(best[i], best[j] + 1)
+    return best[-1] <= _NP_PINYIN_MAX_SYLLABLES
+
 # ── Name-order inference ──
 # ``name_order="auto"`` weighs how given-name-like and surname-like each token
 # looks. The evidence is only loaded on first use. See scripts/build_name_evidence.py.
@@ -649,6 +699,91 @@ def _auto_order(t0, t1):
     if margin > _AUTO_MARGIN:
         return True, False
     return False, -margin >= _AUTO_CONFIDENT
+
+_CAPS_INITIALS = re.compile(r'^[A-Z]{2,3}$')
+
+def _np_split_caps_initials(tokens):
+    """"NF Bevis" -> ["N", "F", "Bevis"]: a run of two or three capitals in front of a
+    mixed-case word is a person's initials, run together (the PubMed style), not a word."""
+    if len(tokens) < 2 or len(tokens) > 5 or not _CAPS_INITIALS.match(tokens[0]):
+        return tokens
+    if all(t.isupper() for t in tokens):
+        return tokens  # shouting: "NF BEVIS" carries no case evidence
+    rest = tokens[1:]
+    if any(t.isupper() and len(t) > 1 for t in rest):
+        return tokens
+    head = _evidence_key(tokens[0])
+    scores, pinyin = _name_evidence()
+    if head in pinyin or head in _NP_CHINESE_ROMANIZED_SURNAMES or head in _NP_KOREAN_ROMANIZED_SURNAMES:
+        # "MA Bankole" are initials; "MA Youzhi" is a Chinese name written surname-first
+        if len(rest) == 1 and _np_pinyin_segmentable(rest[0]) and scores.get(_evidence_key(rest[0]), 0.0) < _PINYIN_GIVEN_GUARD:
+            return tokens
+    return list(tokens[0]) + rest
+
+def _np_auto_reorder_with_initials(tokens):
+    """Return ``(first, middle, last)`` when ``tokens`` read "Surname Given [initials]", else None."""
+    t0 = tokens[0]
+    if len(_evidence_key(t0)) < 2 or _NP_INITIAL_TOKEN.match(t0) or t0.lower() in _NP_COMPOUND_PREFIXES:
+        return None
+    scores = _name_evidence()[0]
+    rest = tokens[1:]
+    dotted = [bool(re.fullmatch(r'[A-Z]\.', t)) for t in rest]
+    if len(rest) >= 2 and all(dotted):
+        # "Klimanov V. V.": every later token is a dotted initial
+        if scores.get(_evidence_key(t0), 0.0) < _AUTO_INITIAL_GUARD:
+            return rest[0], ' '.join(rest[1:]), t0
+        return None
+    if len(tokens) == 3 and _NP_INITIAL_TOKEN.match(tokens[2]) and not _NP_INITIAL_TOKEN.match(tokens[1]):
+        # "Smith John P.": judge the two words like a plain two-token name
+        if _auto_order(t0, tokens[1])[0]:
+            return tokens[1], tokens[2], t0
+    return None
+
+# ── Compound (double) surnames ──
+# "Maria Garcia Lopez", "Juan Carlos Perez Gomez": two surname-like tokens at the
+# end of a name usually form one surname. Decided from the lexicon scores of the
+# last three tokens; the cut-offs were chosen on half of the gold set and checked
+# on the other half.
+
+_BIN_STRONG = 2.0   # at least this given-name-like: 'G'
+_BIN_SURNAME = -3.0  # at most this surname-like: 'S'
+
+def _score_bin(token):
+    score = _name_evidence()[0].get(_evidence_key(token), 0.0)
+    if score >= _BIN_STRONG:
+        return 'G'
+    if score > 0:
+        return 'g'
+    if score == 0:
+        return '0'
+    return 's' if score > _BIN_SURNAME else 'S'
+
+def _np_has_double_surname(tokens):
+    """True when the last two of ``tokens`` read as one compound surname."""
+    if len(tokens) < 3:
+        return False
+    tail = tokens[-3:]
+    if len(tokens[0].rstrip('.')) < 2:
+        return False
+    for tok in tail:
+        plain = _np_clean(tok)
+        if not plain or len(plain) < 3 or not re.fullmatch(r"[a-z]+(?:[-'][a-z]+)*", plain):
+            return False
+    if any(t.lower().rstrip('.') in _NP_COMPOUND_PREFIXES for t in tokens):
+        return False
+    before, penult, final = (_score_bin(t) for t in tail)
+    if len(tokens) > 3:
+        # "Maria Isabel Garcia Lopez": the token before the pair must be given-name-like too
+        if _score_bin(tokens[0]) != 'G' or before != 'G':
+            return False
+        return (penult == 'S' and final in 'Ss0g') or (penult in '0s' and final == 'S')
+    if penult != 'S':
+        return False
+    # "Maria Garcia Lopez": a given-name-like first token, or an unknown one when the last is a clear surname
+    if final == 'S' and before in 'G0s':
+        return True
+    # Accents point to Iberian naming, where a second surname is the norm.
+    return not ''.join(tokens).isascii() and before == 'G' and final in 'Ss0g'
 
 # ── Cyrillic patronymic endings ──
 
@@ -970,6 +1105,8 @@ def _np_parse_latin(name, name_order='first_last'):
         return _np_out(title=title, last=_np_clean(tokens[0]), suffix=suffix,
                        nickname=nickname, confidence='high')
 
+    tokens = _np_split_caps_initials(tokens)
+
     if name_order == 'last_first':
         # The caller says the surname leads ("Priem Jason R."): no guessing, and a
         # leading compound surname ("van der Berg Jan") stays together.
@@ -1000,6 +1137,16 @@ def _np_parse_latin(name, name_order='first_last'):
         if t1_lower in _NP_CHINESE_ROMANIZED_SURNAMES and t0_lower not in _NP_CHINESE_ROMANIZED_SURNAMES:
             return _np_out(title=title, first=_np_clean(tokens[0]), last=_np_clean(tokens[1]),
                            suffix=suffix, nickname=nickname, confidence='high')
+        # Short pinyin surnames that double as ordinary words ("Lu", "He", "Wu", "Ou") are left out of
+        # the set above, but "LU Qing" is still surname-first: the second token spells pinyin
+        # syllables and is not a surname itself, while the first one is.
+        a_key, b_key = _evidence_key(tokens[0]), _evidence_key(tokens[1])
+        if (a_key in _name_evidence()[1] and b_key not in _name_evidence()[1] and len(b_key) >= 2
+                and a_key not in _NP_KOREAN_ROMANIZED_SURNAMES and b_key not in _NP_KOREAN_ROMANIZED_SURNAMES
+                and _name_evidence()[0].get(b_key, 0.0) < _PINYIN_GIVEN_GUARD
+                and _np_pinyin_segmentable(tokens[1])):
+            return _np_out(title=title, first=_np_clean(tokens[1]), last=_np_clean(tokens[0]),
+                           suffix=suffix, nickname=nickname, confidence='medium')
         if name_order == 'auto':
             # Without a comma the order is a guess. Flipped parses are inferences,
             # so they are never 'high'; neither is a parse with no evidence behind it.
@@ -1011,6 +1158,26 @@ def _np_parse_latin(name, name_order='first_last'):
                            suffix=suffix, nickname=nickname, confidence='high' if confident else 'medium')
         return _np_out(title=title, first=_np_clean(tokens[0]), last=_np_clean(tokens[1]),
                        suffix=suffix, nickname=nickname, confidence='high')
+
+    if name_order == 'auto' and len(tokens) >= 3:
+        # "Klimanov V. V." / "Smith John P.": a surname followed by given names and initials.
+        reordered = _np_auto_reorder_with_initials(tokens)
+        if reordered:
+            first, middle, last = reordered
+            return _np_out(title=title, first=_np_clean(first), middle=_np_clean(middle) if middle else None,
+                           last=_np_clean(last), suffix=suffix, nickname=nickname, confidence='medium')
+
+    # "Dharunraja S R": South Indian style, where the surname is itself initials. Two or more
+    # bare capitals at the end, after a real word, read as one surname.
+    run = 0
+    while run < len(tokens) - 1 and re.fullmatch(r'[A-Z]', tokens[-1 - run]):
+        run += 1
+    if run >= 2 and len(tokens[-run - 1].rstrip('.')) >= 2 and tokens[-run - 1].lower() not in _NP_COMPOUND_PREFIXES:
+        head = tokens[:-run]
+        return _np_out(title=title, first=_np_clean(head[0]),
+                       middle=_np_clean(' '.join(head[1:])) if len(head) > 1 else None,
+                       last=_np_clean(' '.join(tokens[-run:])), suffix=suffix, nickname=nickname,
+                       confidence='medium')
 
     surname_start = len(tokens) - 1
     found_prefix = False
@@ -1025,6 +1192,8 @@ def _np_parse_latin(name, name_order='first_last'):
         else:
             break
 
+    if surname_start == len(tokens) - 1 and _np_has_double_surname(tokens):
+        surname_start -= 1
     conf = 'high' if found_prefix else 'medium'
     first = _np_clean(tokens[0])
     if surname_start == 1:

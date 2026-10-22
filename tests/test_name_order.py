@@ -90,6 +90,28 @@ def test_auto_reads_an_upper_cased_leading_surname():
     assert _fl("KIM LEE", name_order="auto")[:2] == ("kim", "lee")  # both shouting: no evidence
 
 
+# ── auto: Chinese surnames the default table does not cover ──
+
+@pytest.mark.parametrize("name", ["Duan Tianxiang", "Liao Jingqiu"])
+def test_pinyin_surname_first_without_a_comma(name):
+    """A pinyin surname followed by a token that spells pinyin syllables is surname-first, in every mode."""
+    surname, given = name.lower().split()
+    assert _fl(name, name_order="auto")[:2] == (given, surname)
+    assert _fl(name)[:2] == (given, surname)
+
+
+@pytest.mark.parametrize("name", ["LU Qing", "WU Shu-hui", "HE Jian-ling", "OU Zhibing"])
+def test_short_pinyin_surnames_lead_when_the_rest_is_pinyin(name):
+    surname, given = name.lower().split()
+    assert _fl(name)[:2] == (given, surname)
+
+
+@pytest.mark.parametrize("name", ["Lu Anna", "Ho Nikolai"])
+def test_pinyin_surname_rule_needs_pinyin_syllables_after_it(name):
+    first, last = name.lower().split()
+    assert _fl(name)[:2] == (first, last)
+
+
 @pytest.mark.parametrize("name", ["Zhang Wei", "Wang Fang", "Kim Minjun", "Hongji Zhang"])
 def test_auto_leaves_the_existing_cjk_rules_alone(name):
     got, want = parse_name(name, name_order="auto"), parse_name(name)
@@ -154,7 +176,7 @@ def test_auto_pays_off_on_a_mixed_order_corpus(ordered_rows):
     baseline = _accuracy(ordered_rows, mixed, "first_last")
     auto = _accuracy(ordered_rows, mixed, "auto")
     assert baseline < 0.65
-    assert auto >= 0.79
+    assert auto >= 0.80
 
 
 def test_auto_recovers_most_last_first_names(ordered_rows):

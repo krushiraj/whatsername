@@ -43,6 +43,75 @@ def test_author_list_in_one_string_takes_the_first_author():
     assert (r["first"], r["last"]) == ("anna", "weber")
 
 
+def test_trailing_particle_stays_with_the_given_names():
+    assert fml("Santos, Sergio Vieira dos") == ("sergio", "vieira dos", "santos")
+
+
+# ── compound surnames ──
+
+@pytest.mark.parametrize("raw, last", [
+    ("Maria Hinojosa Aguirre", "hinojosa aguirre"),
+    ("Jose Castillo Velazquez", "castillo velazquez"),
+    ("Ana Julia Sartori Ramos", "sartori ramos"),
+])
+def test_two_surname_like_tokens_form_one_surname(raw, last):
+    assert parse_name(raw)["last"] == last
+
+
+@pytest.mark.parametrize("raw", ["John Michael Smith", "Anna Maria Rossi", "Peter Hans Meier"])
+def test_given_name_middle_names_are_not_surnames(raw):
+    assert parse_name(raw)["last"] == raw.split()[-1].lower()
+
+
+# ── caps initials and pinyin ──
+
+@pytest.mark.parametrize("raw, want", [
+    ("NF Bevis", ("n", "f", "bevis")),
+    ("AKM Ahsan Ullah", ("a", "k m ahsan", "ullah")),
+    ("TS Rao", ("t", "s", "rao")),
+    ("MA Bankole", ("m", "a", "bankole")),
+])
+def test_run_together_capitals_are_initials(raw, want):
+    assert fml(raw) == want
+
+
+@pytest.mark.parametrize("raw", ["NF BEVIS", "KIM LEE"])
+def test_all_capitals_carry_no_initials_evidence(raw):
+    assert parse_name(raw)["first"] == raw.split()[0].lower()
+
+
+def test_pinyin_syllables_are_recognised_as_such():
+    from whatsername.parser import _np_pinyin_segmentable as seg
+    assert all(seg(w) for w in ("qing", "shu-hui", "zhibing", "xiaohua", "wang"))
+    assert not any(seg(w) for w in ("bankole", "nikolai", "robert", "mohammed", "schmid"))
+
+
+# ── trailing initials, auto-order with initials, organisations ──
+
+@pytest.mark.parametrize("raw, want", [
+    ("Dharunraja S R", ("dharunraja", None, "s r")),
+    ("Helen Shaji J C", ("helen", "shaji", "j c")),
+])
+def test_two_bare_capitals_at_the_end_are_a_surname(raw, want):
+    assert fml(raw) == want
+
+
+def test_a_single_trailing_initial_is_still_a_middle_initial():
+    assert fml("Helen Shaji J") == ("helen", "shaji", "j")
+
+
+@pytest.mark.parametrize("raw, want", [
+    ("Klimanov V. V.", ("v.", "v.", "klimanov")),
+    ("Priem Jason R.", ("jason", "r.", "priem")),
+])
+def test_auto_reads_surname_then_given_names_and_initials(raw, want):
+    assert fml(raw, name_order="auto") == want
+
+
+def test_auto_keeps_first_middle_initial_last():
+    assert fml("Anna M. Rossi", name_order="auto") == ("anna", "m.", "rossi")
+
+
 @pytest.mark.parametrize("raw", [
     "Natural History Museum", "Agencia Nacional de Investigacion", "Faculdade de Medicina",
     "Ministère de la Santé", "Biodiversity Research Group", "Stevens Foundation Trust",
