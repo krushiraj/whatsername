@@ -243,6 +243,10 @@ _NP_TITLE_PATTERNS = [
     (re.compile(r'^ing\.?\s+', re.IGNORECASE), 'ing.'),
 ]
 
+# Courtesy titles that are also ordinary words or names ("Sir", "Miss"): taken only when two or
+# more words follow, so "Sir Ahmed" stays a name.
+_NP_COURTESY_TITLES = re.compile(r'^(mr|mrs|ms|miss|sir|dame|rev)\.?\s+', re.IGNORECASE)
+
 _NP_ORG_KEYWORDS = [
     'institute', 'university', 'ministry', 'society', 'department',
     'academy', 'foundation', 'laboratory', 'board', 'commission',
@@ -859,6 +863,47 @@ _NP_PATRONYMIC_ENDINGS = (
 
 # ── Output helper ──
 
+_GLUE_BOUNDARY = re.compile(r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
+_GLUE_PREFIXES = frozenset(['mc', 'mac', 'de', 'di', 'da', 'del', 'la', 'le', 'van', 'von', 'o', 'd', 'st',
+                            'al', 'el', 'ben', 'bin', 'ter', 'ten', 'der', 'den', 'du', 'dos', 'das'])
+
+
+def _np_split_glued(token):
+    """Split a single glued token ("YuanWang", "GuoxingZHANG", "SungKunKim").
+
+    Returns ``(first, middle, last)`` or None. Only a camel-case or lower-to-CAPS
+    boundary is used, never a guess inside a lowercase run, and the two-word case
+    needs a clear pinyin surname at the end."""
+    if not (token.isascii() and token.isalpha()):
+        return None
+    parts = _GLUE_BOUNDARY.split(token)
+    if not 2 <= len(parts) <= 3 or any(len(p) < 2 for p in parts):
+        return None
+    if parts[0].lower() in _GLUE_PREFIXES:
+        return None
+    keys = [p.lower() for p in parts]
+    if len(parts) == 2:
+        a, b = parts
+        if b.isupper() and not a.isupper():
+            return a, None, b
+        if a.isupper() or b.isupper():
+            return None
+        scores = _name_evidence()[0]
+        sa, sb = scores.get(keys[0], 0.0), scores.get(keys[1], 0.0)
+        # Only the pinyin case is decisive: a clear surname closing a pinyin-shaped word.
+        # Western pairs ("LightMart", "VojnovicMilan") are left whole; no word list can
+        # tell a brand from a name, and a split that is wrong costs more than none.
+        if keys[1] in _NP_CHINESE_ROMANIZED_SURNAMES and sb <= -2.0 and sa - sb >= 3.0 \
+                and keys[0] not in _NP_KOREAN_ROMANIZED_SURNAMES and _np_pinyin_segmentable(keys[0]):
+            return a, None, b
+        return None
+    if any(p.isupper() for p in parts):
+        return None
+    if keys[2] in _NP_KOREAN_ROMANIZED_SURNAMES and keys[1] not in _NP_KOREAN_ROMANIZED_SURNAMES:
+        return parts[0], parts[1], parts[2]
+    return None
+
+
 def _np_out(title=None, first=None, middle=None, last=None, suffix=None,
             nickname=None, confidence='high'):
     return {
@@ -1115,6 +1160,11 @@ def _np_parse_latin(name, name_order='first_last'):
             title = title_val
             r = r[m.end():].strip()
             break
+    else:
+        m = _NP_COURTESY_TITLES.match(r)
+        if m and len(r[m.end():].split()) >= 2:
+            title = m.group(1).lower() + '.'
+            r = r[m.end():].strip()
 
     suffix = None
     suffix_match = re.search(r',?\s+(Jr\.?|Junior|Júnior|Sr\.?|III|IV|II|Esq\.?)$', r, re.IGNORECASE)
@@ -1162,11 +1212,18 @@ def _np_parse_latin(name, name_order='first_last'):
             r = segs[0] if segs else ''
 
     r = re.sub(r'\b([A-Z])\.-([A-Z])\.', r'\1. \2.', r)
+    r = re.sub(r'^([A-Z])(\.?)-([A-Z])\b(\.?)(?=\s)', r'\1\2 \3\4', r)
     tokens = r.split()
 
     if len(tokens) == 0:
         return _np_out(last=_np_clean(r), suffix=suffix, nickname=nickname)
     if len(tokens) == 1:
+        glued = _np_split_glued(tokens[0])
+        if glued:
+            return _np_out(title=title, first=_np_clean(glued[0]),
+                           middle=_np_clean(glued[1]) if glued[1] else None,
+                           last=_np_clean(glued[2]), suffix=suffix, nickname=nickname,
+                           confidence='medium')
         return _np_out(title=title, last=_np_clean(tokens[0]), suffix=suffix,
                        nickname=nickname, confidence='high')
 

@@ -159,3 +159,37 @@ def test_institutions_have_no_first_name(raw):
 def test_a_bracketed_role_does_not_make_a_person_an_organisation():
     r = parse_name("Stevens R.K. (Guest Editors)")
     assert "editors" not in (r["last"] or "")
+
+
+def test_glued_caps_surname_is_split():
+    for raw, first, last in [("GuoxingZHANG", "guoxing", "zhang"), ("GepingLI", "geping", "li")]:
+        r = parse_name(raw)
+        assert (r["first"], r["last"]) == (first, last)
+
+
+def test_glued_pinyin_and_korean_names_are_split():
+    r = parse_name("YuanWang")
+    assert (r["first"], r["last"]) == ("yuan", "wang")
+    r = parse_name("SungKunKim")
+    assert (r["first"], r["middle"], r["last"]) == ("sung", "kun", "kim")
+
+
+def test_glued_western_words_and_prefixes_stay_whole():
+    for raw in ("LightMart", "McDonald", "DeSilva", "VanDyke", "GuoShao"):
+        r = parse_name(raw)
+        assert r["first"] is None and r["last"] == raw.lower()
+
+
+def test_courtesy_titles_need_two_words_after_them():
+    r = parse_name("Mr Tomer Ben-Shushan")
+    assert (r["title"], r["first"], r["last"]) == ("mr.", "tomer", "ben-shushan")
+    r = parse_name("Sir Ahmed")
+    assert r["title"] is None
+
+
+def test_leading_hyphenated_initials_split():
+    for raw, first, last in [("H.-K Chung", "h.", "chung"), ("S-Y Koay", "s", "koay")]:
+        r = parse_name(raw)
+        assert (r["first"], r["last"]) == (first, last)
+    r = parse_name("Chen L-Y")
+    assert r["last"] == "chen"
