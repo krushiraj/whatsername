@@ -292,6 +292,9 @@ _NP_DOTTED_ONLY_CREDS = frozenset(['ms', 'ma', 'mba', 'mfa', 'ba', 'bs'])
 _NP_GENERATIONAL = frozenset(['jr', 'sr', 'ii', 'iii', 'iv', 'v', 'esq'])
 
 _CRED_RE = re.compile(r'(,\s*|\s+)([A-Za-z][A-Za-z.]*\.?)\s*$')
+_NP_GENERATIONAL_RE = re.compile(r'^(?:Jr\.?|Junior|Júnior|Sr\.?|III|IV|II|Esq\.?)$', re.IGNORECASE)
+_NP_GENERATIONAL_TAIL = re.compile(r'\s+(Jr\.?|Sr\.?|III|IV|II|Esq\.?)$', re.IGNORECASE)  # not 'Júnior': that is part of the surname before a comma
+_NP_INITIALS_RUN = re.compile(r'^(?:[A-Za-z]\.){2,}$')  # 'J.D.', 'H.G.G.M.': a person's initials, usually
 
 def _np_acronym_shape(s):
     """Cred-shape heuristic for unknown acronyms (MBA, MFA, FRACP, FAHMS, ...).
@@ -349,9 +352,22 @@ def _np_segment_is_credential(seg_tokens):
     return True
 
 
+def _np_leading_cred_is_name(tok):
+    """'MD', 'MA', 'MS', 'DO' lead a name far more often as an abbreviated given name or as
+    initials ('MD. Ariful Islam', 'MA Bankole') than as a degree. 'RN', 'PhD' and the like
+    stay credentials."""
+    norm = tok.replace('.', '').lower()
+    return norm in _NP_DOTTED_ONLY_CREDS or norm in ('md', 'do')
+
+
 def _np_drop_credential_segments(r):
     """Drop comma segments that are purely credentials; also strip cred tokens
     inside mixed segments (mid-stream) when >=2 name tokens survive.
+
+    Returns ``(name, credentials)``. ``credentials`` are the lowercase, dot-free credentials
+    that trail the whole name ('Markus Meyer, MD, PhD' -> ['md', 'phd']), so the caller can
+    report them as the suffix. Credentials sitting between the surname and the given name
+    ('Davatzikos, PhD, Christos') or inside a segment are dropped without being reported.
 
     Fixes:
       - 'Davatzikos, PhD, Christos'      -> drops PhD segment
@@ -362,11 +378,13 @@ def _np_drop_credential_segments(r):
     Preserves:
       - 'Alam Md. Mahbub'                -> 'Md.' mixed case kept as name
       - 'Dang V Do' / 'Ron Do'           -> 'Do' short + mixed case kept
+      - 'MD. Ariful Islam' / 'MA Bankole' -> a short leading token is a name, not a degree
     """
     if not r:
-        return r
+        return r, []
     segments = [s.strip() for s in r.split(',')]
     kept = []
+    cred_marks = []  # (index in kept after which it was dropped, credentials of that segment)
     for seg in segments:
         if not seg:
             continue
@@ -374,9 +392,16 @@ def _np_drop_credential_segments(r):
         if not tokens:
             continue
         if _np_segment_is_credential(tokens):
+            cred_marks.append((len(kept), [t.replace('.', '').lower() for t in tokens]))
             continue
-        non_cred = [t for t in tokens if not _np_mid_is_credential_token(t)]
-        first_was_cred = _np_mid_is_credential_token(tokens[0])
+        joined = ''.join(tokens).replace('.', '')  # 'Ph. D.' -> 'PhD'
+        if len(tokens) == 2 and len(joined) >= 3 and _np_segment_is_credential([joined]):
+            cred_marks.append((len(kept), [joined.lower()]))
+            continue
+        lead_is_name = _np_leading_cred_is_name(tokens[0]) and len(tokens) >= 2
+        non_cred = [t for i, t in enumerate(tokens)
+                    if not _np_mid_is_credential_token(t) or (i == 0 and lead_is_name)]
+        first_was_cred = _np_mid_is_credential_token(tokens[0]) and not lead_is_name
         if 2 <= len(non_cred) < len(tokens):
             # Standard mid-stream strip — >=2 name tokens survive.
             seg = ' '.join(non_cred)
@@ -386,7 +411,8 @@ def _np_drop_credential_segments(r):
             # creds even if only 1 name token remains.
             seg = ' '.join(non_cred)
         kept.append(seg)
-    return ', '.join(kept)
+    trailing = [c for at, creds in cred_marks if at >= len(kept) for c in creds]
+    return ', '.join(kept), trailing
 
 
 def _np_strip_credentials(r, existing_suffix):
@@ -431,8 +457,13 @@ def _np_strip_credentials(r, existing_suffix):
         )
         # Dotted shape-like tokens of length >=4 (e.g. B.Tech., M.Tech.) count as
         # whitelisted for anchor purposes — internal dots are a strong cred signal.
-        if not is_wl and has_internal_dot and _np_acronym_shape(raw_no_dot) and len(raw_no_dot) >= 4:
+        initials_run = bool(_NP_INITIALS_RUN.match(token))
+        if not is_wl and has_internal_dot and _np_acronym_shape(raw_no_dot) and len(raw_no_dot) >= 4 \
+                and not initials_run:
             is_wl = True
+        if is_wl and initials_run and norm != 'md' \
+                and ' ' not in probe[:m.start()].rstrip(', \t').strip():
+            break  # 'Lawrence, J.D.': stripping it would leave a surname with no given name
         if is_wl:
             # Short (<=2 char) creds need a guard to avoid eating surnames
             # (Ma, Do, Ha, Sa). Exempted when:
@@ -725,6 +756,17 @@ def _np_parse_arabic(raw):
 
 # ── Latin parser ──
 
+def _np_is_author_list(segs):
+    """True when comma segments read as several people ("Verena Menz, Mona Semsch, Florian
+    Mosbach") rather than "Surname, Given, extra". Needs three or more multi-word segments, and a
+    first segment that does not start with a surname particle ("Van Der Berg, Jan, Antwerp")."""
+    head = segs[:3]
+    if len(head) < 3 or not all(len(seg.split()) >= 2 for seg in head):
+        return False
+    return segs[0].split()[0].lower().rstrip('.') not in _NP_COMPOUND_PREFIXES
+
+
+
 def _np_parse_latin(name):
     r = name.strip()
     r = re.sub(r'\s+\d{4}-\s*$', '', r)
@@ -740,14 +782,28 @@ def _np_parse_latin(name):
     r = re.sub(r'^\s*-\s*', '', r)
     r = re.sub(r'\s+', ' ', r).strip()
 
+    # Affiliations in brackets ("Kulesza, Joel A. [Los Alamos National Laboratory]") are not part
+    # of the name, and neither are life dates ("Huber, Kaspar (1825 - 1882), Kupferstecher").
+    r = re.sub(r'\s*\[[^\]]*\]', '', r)
+    r, _life_dates = re.subn(r'\s*\(\s*\d{3,4}\s*-\s*\d{0,4}\s*\)', '', r)
+
+    # "First Last; First Last; ..." keeps the first author. Done before the organisation test
+    # so an affiliation riding along in a later part cannot turn a person into an organisation.
+    if ';' in r:
+        parts = r.split(';')
+        if len(parts) >= 2 and len(parts[0].strip().split()) >= 2 and len(parts[1].strip().split()) >= 2:
+            r = parts[0].strip()
+
     # Drop comma segments that are pure credentials + mid-stream cred tokens
     # before any first/last role assignment.
-    r = _np_drop_credential_segments(r)
+    r, _segment_creds = _np_drop_credential_segments(r)
 
     # Strip credentials BEFORE the dot-split, so trailing 'M.D.' / 'Ph.D.' /
     # 'M.S.' tokens are matched in compact form (the dot-split below would
     # otherwise turn 'M.D.' into 'M. D.' which the strip can't reassemble).
     r, _early_cred_suffix = _np_strip_credentials(r, None)
+    if _segment_creds:
+        _early_cred_suffix = ', '.join(([_early_cred_suffix] if _early_cred_suffix else []) + _segment_creds)
 
     r = re.sub(r'\.([A-Z])', r'. \1', r)
 
@@ -756,10 +812,6 @@ def _np_parse_latin(name):
         if kw in r_lower:
             return _np_out(last=_np_clean(r))
 
-    if ';' in r:
-        parts = r.split(';')
-        if len(parts) >= 2 and len(parts[0].strip().split()) >= 2 and len(parts[1].strip().split()) >= 2:
-            r = parts[0].strip()
     et_al_match = re.search(r'\bet\s+al\.?\s*$', r, re.IGNORECASE)
     if et_al_match:
         r = r[:et_al_match.start()].strip()
@@ -801,17 +853,30 @@ def _np_parse_latin(name):
             suffix = f"{gen}, {suffix}" if suffix else gen
 
     if ',' in r:
-        parts = r.split(',', 1)
-        last_part = parts[0].strip()
-        first_part = parts[1].strip()
-        if first_part:
+        segs = [seg.strip() for seg in r.split(',') if seg.strip()]
+        if len(segs) >= 3 and _NP_GENERATIONAL_RE.match(segs[1]):
+            # "Farrell, Jr., Robert E": the generation marker sits between surname and given name.
+            gen = _np_clean(segs.pop(1))
+            suffix = f"{gen}, {suffix}" if suffix else gen
+        elif len(segs) >= 2:
+            tail = _NP_GENERATIONAL_TAIL.search(segs[0])
+            if tail and len(segs[0].split()) >= 2:
+                # "Knodler Jr, Michael"
+                gen = _np_clean(tail.group(1))
+                suffix = f"{gen}, {suffix}" if suffix else gen
+                segs[0] = segs[0][:tail.start()].strip()
+        if len(segs) >= 3 and _np_is_author_list(segs):
+            r = segs[0]  # several people in one string: parse the first
+        elif len(segs) >= 2:
+            last_part = segs[0]
+            first_part = segs[1] if _life_dates else ', '.join(segs[1:])
             ftokens = first_part.split()
             first = _np_clean(ftokens[0])
             middle = _np_clean(' '.join(ftokens[1:])) if len(ftokens) > 1 else None
+            return _np_out(title=title, first=first, middle=middle, last=_np_clean(last_part),
+                           suffix=suffix, nickname=nickname, confidence='high')
         else:
-            first, middle = None, None
-        return _np_out(title=title, first=first, middle=middle, last=_np_clean(last_part),
-                       suffix=suffix, nickname=nickname, confidence='high')
+            r = segs[0] if segs else ''
 
     r = re.sub(r'\b([A-Z])\.-([A-Z])\.', r'\1. \2.', r)
     tokens = r.split()
