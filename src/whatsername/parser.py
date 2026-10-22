@@ -739,6 +739,18 @@ def _np_auto_reorder_with_initials(tokens):
             return tokens[1], tokens[2], t0
     return None
 
+# ── List-level order inference ──
+# Authors of one paper or one record usually share a convention, so the names
+# of a list vote together. Each name contributes a signed number: positive when
+# it reads "Last First", negative when it reads "First Last", zero when it has
+# no opinion. A list is read "Last First" only when the weight of that
+# evidence clearly outweighs the opposite, which keeps correctly ordered lists
+# on the default parse.
+
+_LIST_VOTE_CLIP = 4.0   # one name never counts for more than this
+_LIST_VOTE_CJK = 2.0    # a CJK-family surname next to a non-surname
+_LIST_MARGIN = 4.0      # net evidence needed before a list is read "Last First"
+
 # ── Compound (double) surnames ──
 # "Maria Garcia Lopez", "Juan Carlos Perez Gomez": two surname-like tokens at the
 # end of a name usually form one surname. Decided from the lexicon scores of the
@@ -784,6 +796,59 @@ def _np_has_double_surname(tokens):
         return True
     # Accents point to Iberian naming, where a second surname is the norm.
     return not ''.join(tokens).isascii() and before == 'G' and final in 'Ss0g'
+
+def _order_signal(raw):
+    if ',' in raw or not raw.isascii():
+        return 0.0
+    tokens = raw.split()
+    if len(tokens) < 2 or len(tokens) > 3:
+        return 0.0
+    if len(tokens) == 3 and not _NP_INITIAL_TOKEN.match(tokens[1]):
+        return 0.0  # "Anna Maria Rossi": too ambiguous to vote
+    t0, t1 = tokens[0], tokens[-1]
+    scores, pinyin = _name_evidence()
+    a, b = _evidence_key(t0), _evidence_key(t1)
+    cjk_surnames = _NP_CHINESE_ROMANIZED_SURNAMES | _NP_KOREAN_ROMANIZED_SURNAMES | pinyin
+    a_cjk, b_cjk = a in cjk_surnames, b in cjk_surnames
+    if a_cjk != b_cjk and len(a) >= 2 and len(b) >= 2 and not (t0.isupper() and t1.isupper()):
+        return _LIST_VOTE_CJK if a_cjk else -_LIST_VOTE_CJK
+    if a_cjk and b_cjk:
+        return 0.0
+    t0_initial, t1_initial = bool(_NP_INITIAL_TOKEN.match(t0)), bool(_NP_INITIAL_TOKEN.match(t1))
+    if t0_initial and not t1_initial:
+        return -_LIST_VOTE_CLIP
+    if t1_initial and not t0_initial and len(a) >= 2:
+        return 2.0 if scores.get(a, 0.0) < _AUTO_INITIAL_GUARD else -1.0
+    if len(a) < 2 or len(b) < 2:
+        return 0.0
+    if len(t0) >= 3 and t0.isupper() and not t1.isupper():
+        return 2.0
+    return max(-_LIST_VOTE_CLIP, min(_LIST_VOTE_CLIP, scores.get(b, 0.0) - scores.get(a, 0.0)))
+
+def infer_name_order(names):
+    """Return ``"first_last"`` or ``"last_first"`` for a list of names that share a convention.
+
+    The default is ``"first_last"``; the list is read ``"last_first"`` only when
+    its names, taken together, lean clearly that way.
+    """
+    signals = [_order_signal(n) for n in names if n]
+    last_first = sum(s for s in signals if s > 0)
+    first_last = -sum(s for s in signals if s < 0)
+    return 'last_first' if last_first - first_last > _LIST_MARGIN else 'first_last'
+
+def parse_names(names, name_order='auto'):
+    """Parse the names of one record (e.g. one paper's authors).
+
+    ``name_order="auto"`` infers one order for the whole list with
+    :func:`infer_name_order`, so a list written "First Last" parses exactly like
+    :func:`parse_name`, and a list written "Last First" is read consistently.
+    ``"first_last"`` and ``"last_first"`` are applied to every name.
+    """
+    names = list(names)
+    if name_order not in _NAME_ORDERS:
+        raise ValueError(f"name_order must be one of {_NAME_ORDERS}, got {name_order!r}")
+    order = infer_name_order(names) if name_order == 'auto' else name_order
+    return [_np_parse_name(n, name_order=order) for n in names]
 
 # ── Cyrillic patronymic endings ──
 

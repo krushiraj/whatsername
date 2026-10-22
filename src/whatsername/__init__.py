@@ -18,12 +18,14 @@ Two entry points:
 """
 
 from .parser import (
+    infer_name_order,
     parse_human_name,
     parse_human_name_hnp,
+    parse_names,
 )
 from .parser import _np_parse_name as _np_parse_name
 
-__all__ = ["parse_name", "parse_human_name", "parse_human_name_hnp"]
+__all__ = ["parse_name", "parse_names", "infer_name_order", "parse_human_name", "parse_human_name_hnp"]
 
 __version__ = "0.1.0"
 

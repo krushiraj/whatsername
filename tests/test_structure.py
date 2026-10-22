@@ -1,7 +1,7 @@
 """Structural rules: credentials, generations, compound surnames, initials, list order."""
 import pytest
 
-from whatsername import parse_name
+from whatsername import infer_name_order, parse_name, parse_names
 
 
 def fml(raw, **kw):
@@ -84,6 +84,41 @@ def test_pinyin_syllables_are_recognised_as_such():
     from whatsername.parser import _np_pinyin_segmentable as seg
     assert all(seg(w) for w in ("qing", "shu-hui", "zhibing", "xiaohua", "wang"))
     assert not any(seg(w) for w in ("bankole", "nikolai", "robert", "mohammed", "schmid"))
+
+
+# ── lists ──
+
+def test_first_last_list_parses_exactly_like_the_default():
+    names = ["Jason Priem", "Heather Piwowar", "Richard Orr", "Anna Maria Rossi"]
+    assert infer_name_order(names) == "first_last"
+    assert parse_names(names) == [parse_name(n) for n in names]
+
+
+def test_last_first_list_is_read_consistently():
+    names = ["Priem Jason", "Piwowar Heather", "Orr Richard", "Smith Daniel"]
+    assert infer_name_order(names) == "last_first"
+    assert [(r["first"], r["last"]) for r in parse_names(names)] == [
+        ("jason", "priem"), ("heather", "piwowar"), ("richard", "orr"), ("daniel", "smith")]
+
+
+def test_surname_with_trailing_initials_list():
+    names = ["Priem J.", "Piwowar H.", "Orr R."]
+    assert infer_name_order(names) == "last_first"
+
+
+def test_ambiguous_or_empty_lists_stay_first_last():
+    assert infer_name_order([]) == "first_last"
+    assert infer_name_order(["Li Wei", "Zhou Li"]) == "first_last"
+
+
+def test_explicit_order_is_applied_to_every_name():
+    got = parse_names(["Jason Priem", "Heather Piwowar"], name_order="last_first")
+    assert [r["first"] for r in got] == ["priem", "piwowar"]
+
+
+def test_unknown_order_is_rejected():
+    with pytest.raises(ValueError):
+        parse_names(["Jason Priem"], name_order="sideways")
 
 
 # ── trailing initials, auto-order with initials, organisations ──
