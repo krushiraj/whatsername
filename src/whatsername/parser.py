@@ -585,6 +585,71 @@ _NP_CHINESE_ROMANIZED_SURNAMES = frozenset([
     'fu', 'zhong', 'kong', 'cui', 'qiu', 'lei', 'yao',
 ])
 
+# ── Name-order inference ──
+# ``name_order="auto"`` weighs how given-name-like and surname-like each token
+# looks. The evidence is only loaded on first use. See scripts/build_name_evidence.py.
+
+_NAME_ORDERS = ("first_last", "last_first", "auto")
+_AUTO_MARGIN = 3.0         # evidence (nats) required to read "Last First" from the lexicon alone
+_AUTO_INITIAL_GUARD = 1.0  # "Word J": stay "First Last" if Word is at least this given-name-like
+_AUTO_CONFIDENT = 1.0      # evidence in favour of "First Last" needed to report 'high'
+_NP_INITIAL_TOKEN = re.compile(r'^[A-Za-z]\.?$')
+_evidence_cache = None
+
+def _name_evidence():
+    """Return ``(scores, pinyin_surnames)``. ``scores`` maps a lowercase ASCII
+    token to a number that is positive when the token is mostly a given name and
+    negative when it is mostly a surname; unknown tokens score 0."""
+    global _evidence_cache
+    if _evidence_cache is None:
+        with resources.files(__package__).joinpath("data", "name_evidence.json").open(encoding="utf-8") as f:
+            data = json.load(f)
+        scale = data["scale"]
+        scores = {}
+        for level, tokens in data["levels"].items():
+            value = int(level) / scale
+            for token in tokens.split():
+                scores[token] = value
+        _evidence_cache = (scores, frozenset(data["pinyin_surnames"]))
+    return _evidence_cache
+
+def _evidence_key(token):
+    cleaned = _np_clean(token)
+    return re.sub(r'[^a-z]', '', cleaned.lower()) if cleaned else ''
+
+def _auto_order(t0, t1):
+    """Decide the order of two name tokens.
+
+    Returns ``(swap, confident)``. ``swap`` is True when they read as "Last First".
+    Flips are deliberately conservative: a wrong flip costs a name that was
+    already right, so weak evidence keeps the default order and is reported as
+    ``confident=False`` instead.
+    """
+    scores, pinyin = _name_evidence()
+    a, b = _evidence_key(t0), _evidence_key(t1)
+    if a in _NP_CHINESE_ROMANIZED_SURNAMES or a in _NP_KOREAN_ROMANIZED_SURNAMES \
+            or b in _NP_CHINESE_ROMANIZED_SURNAMES or b in _NP_KOREAN_ROMANIZED_SURNAMES:
+        return False, False  # the CJK rules above own these; they declined, so stay ambiguous
+    t0_initial, t1_initial = bool(_NP_INITIAL_TOKEN.match(t0)), bool(_NP_INITIAL_TOKEN.match(t1))
+    if t0_initial and not t1_initial:
+        return False, True   # "J. Priem"
+    if t1_initial and not t0_initial and len(a) >= 2:
+        # "Priem J.": a lone letter is almost never a surname. The exception is
+        # the South Indian "Given S" style, so keep given-name-like words as they are.
+        if scores.get(a, 0.0) < _AUTO_INITIAL_GUARD:
+            return True, False
+        return False, False
+    if len(a) < 2 or len(b) < 2:
+        return False, False
+    if len(t0) >= 3 and t0.isupper() and not t1.isupper():
+        return True, False   # "PRIEM Jason": the upper-cased surname convention
+    if (a in pinyin) != (b in pinyin):
+        return a in pinyin, False
+    margin = scores.get(b, 0.0) - scores.get(a, 0.0)
+    if margin > _AUTO_MARGIN:
+        return True, False
+    return False, -margin >= _AUTO_CONFIDENT
+
 # ── Cyrillic patronymic endings ──
 
 _NP_PATRONYMIC_ENDINGS = (
@@ -782,7 +847,7 @@ def _np_is_author_list(segs):
 
 
 
-def _np_parse_latin(name):
+def _np_parse_latin(name, name_order='first_last'):
     r = name.strip()
     r = re.sub(r'\s+\d{4}-\s*$', '', r)
     r = re.sub(r';\s*id_orcid\s+[\d-]+', '', r)
@@ -905,6 +970,18 @@ def _np_parse_latin(name):
         return _np_out(title=title, last=_np_clean(tokens[0]), suffix=suffix,
                        nickname=nickname, confidence='high')
 
+    if name_order == 'last_first':
+        # The caller says the surname leads ("Priem Jason R."): no guessing, and a
+        # leading compound surname ("van der Berg Jan") stays together.
+        i = 0
+        while i < len(tokens) - 2 and tokens[i].lower().rstrip('.') in _NP_COMPOUND_PREFIXES:
+            i += 1
+        rest = tokens[i + 1:]
+        return _np_out(title=title, first=_np_clean(rest[0]),
+                       middle=_np_clean(' '.join(rest[1:])) if len(rest) > 1 else None,
+                       last=_np_clean(' '.join(tokens[:i + 1])), suffix=suffix, nickname=nickname,
+                       confidence='high')
+
     if len(tokens) == 2:
         t0_lower = tokens[0].lower().rstrip('.')
         t1_lower = tokens[1].lower().rstrip('.')
@@ -923,6 +1000,15 @@ def _np_parse_latin(name):
         if t1_lower in _NP_CHINESE_ROMANIZED_SURNAMES and t0_lower not in _NP_CHINESE_ROMANIZED_SURNAMES:
             return _np_out(title=title, first=_np_clean(tokens[0]), last=_np_clean(tokens[1]),
                            suffix=suffix, nickname=nickname, confidence='high')
+        if name_order == 'auto':
+            # Without a comma the order is a guess. Flipped parses are inferences,
+            # so they are never 'high'; neither is a parse with no evidence behind it.
+            swap, confident = _auto_order(tokens[0], tokens[1])
+            if swap:
+                return _np_out(title=title, first=_np_clean(tokens[1]), last=_np_clean(tokens[0]),
+                               suffix=suffix, nickname=nickname, confidence='medium')
+            return _np_out(title=title, first=_np_clean(tokens[0]), last=_np_clean(tokens[1]),
+                           suffix=suffix, nickname=nickname, confidence='high' if confident else 'medium')
         return _np_out(title=title, first=_np_clean(tokens[0]), last=_np_clean(tokens[1]),
                        suffix=suffix, nickname=nickname, confidence='high')
 
@@ -951,8 +1037,10 @@ def _np_parse_latin(name):
 
 # ── Main entry point ──
 
-def _np_parse_name(raw_author_name):
+def _np_parse_name(raw_author_name, name_order='first_last'):
     """New deterministic parser. Returns dict with confidence field."""
+    if name_order not in _NAME_ORDERS:
+        raise ValueError(f"name_order must be one of {_NAME_ORDERS}, got {name_order!r}")
     if not raw_author_name or not raw_author_name.strip():
         return _np_out()
     r = raw_author_name.strip()
@@ -997,7 +1085,7 @@ def _np_parse_name(raw_author_name):
             return _np_parse_latin(latin_part)
         return _np_out(confidence='low')
 
-    return _np_parse_latin(r)
+    return _np_parse_latin(r, name_order=name_order)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

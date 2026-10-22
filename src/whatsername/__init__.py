@@ -28,7 +28,7 @@ __all__ = ["parse_name", "parse_human_name", "parse_human_name_hnp"]
 __version__ = "0.1.0"
 
 
-def parse_name(raw_author_name):
+def parse_name(raw_author_name, name_order="first_last"):
     """Parse a raw author-name string into structured components.
 
     Returns a dict with keys: ``title``, ``first``, ``middle``, ``last``,
@@ -37,5 +37,16 @@ def parse_name(raw_author_name):
 
     Threshold on ``confidence`` to reject uncertain parses and route them to a
     stronger model.
+
+    ``name_order`` says how to read Latin-script names that have no comma:
+
+    - ``"first_last"`` (default): the given name comes first, apart from the
+      Chinese and Korean surname rules that have always applied.
+    - ``"last_first"``: the caller knows the surname leads ("Priem Jason R.").
+    - ``"auto"``: for corpora that mix "First Last" and "Last First". Two-token
+      names are weighed on how given-name-like and surname-like each token
+      looks, plus a lone trailing initial ("Priem J.") and an upper-cased
+      leading surname ("PRIEM Jason"). It flips only on clear evidence and
+      marks every flipped or unsupported parse ``confidence="medium"``.
     """
-    return _np_parse_name(raw_author_name)
+    return _np_parse_name(raw_author_name, name_order=name_order)
