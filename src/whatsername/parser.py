@@ -251,6 +251,21 @@ _NP_ORG_KEYWORDS = [
     'corporation', 'company', 'group', 'center', 'centre',
 ]
 
+# Whole-word nouns that name a body of people (museum, agency, school, society, ministry...) in the
+# languages that dominate the corpus. Matched on accent-folded tokens of names with two or more
+# words, so a surname that happens to equal one of them still parses as a person when alone.
+_NP_ORG_WORDS = frozenset("""
+    museum museo musee museu museums agency agencia agence project projeto proyecto projet
+    collaboration consortium network initiative collaborative hospital clinic clinica klinik
+    school escola escuela college faculty faculdade facultad fakultet fakulti library biblioteca bureau
+    zentrum centro institut instituto istituto institution universidad universidade universite
+    universitat universiteit akademie academia sociedad sociedade societe gesellschaft servicio servico
+    departamento dipartimento abteilung ministere ministerium ministerio ministerie kommission comision
+    comissao programa programme observatory observatorio laboratorio laboratoire laboratories
+    federation authority administration directorate secretariat comite revista zeitschrift editores
+    editors biodiversity natural history research national cancer
+""".split())
+
 # ── Post-nominal credentials ──
 # Curated for OpenAlex's multilingual corpus. nameparser's SUFFIX_ACRONYMS
 # (609 entries) is deliberately NOT used — it collides heavily with surnames
@@ -807,10 +822,13 @@ def _np_parse_latin(name):
 
     r = re.sub(r'\.([A-Z])', r'. \1', r)
 
-    r_lower = r.lower()
-    for kw in _NP_ORG_KEYWORDS:
-        if kw in r_lower:
-            return _np_out(last=_np_clean(r))
+    # Bracketed text ("(Guest Editors)", "(IJMACR)") says nothing about whether the rest is a person.
+    r_org = re.sub(r'\s+', ' ', re.sub(r'\([^)]*\)|\[[^\]]*\]', ' ', r)).strip()
+    r_lower = r_org.lower()
+    if any(kw in r_lower for kw in _NP_ORG_KEYWORDS) or (
+            len(r_org.split()) >= 2
+            and any(w in _NP_ORG_WORDS for w in re.findall(r'[a-z]+', _np_to_ascii(r_lower)))):
+        return _np_out(last=_np_clean(r_org))
 
     et_al_match = re.search(r'\bet\s+al\.?\s*$', r, re.IGNORECASE)
     if et_al_match:

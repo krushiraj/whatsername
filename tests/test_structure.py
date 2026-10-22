@@ -41,3 +41,17 @@ def test_degree_lookalikes_at_the_front_are_names(raw):
 def test_author_list_in_one_string_takes_the_first_author():
     r = parse_name("Weber, Anna, Keller, Jonas, Meier, Paul")
     assert (r["first"], r["last"]) == ("anna", "weber")
+
+
+@pytest.mark.parametrize("raw", [
+    "Natural History Museum", "Agencia Nacional de Investigacion", "Faculdade de Medicina",
+    "Ministère de la Santé", "Biodiversity Research Group", "Stevens Foundation Trust",
+])
+def test_institutions_have_no_first_name(raw):
+    r = parse_name(raw)
+    assert r["first"] is None and r["last"]
+
+
+def test_a_bracketed_role_does_not_make_a_person_an_organisation():
+    r = parse_name("Stevens R.K. (Guest Editors)")
+    assert "editors" not in (r["last"] or "")
